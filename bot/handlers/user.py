@@ -15,6 +15,7 @@ from bot.keyboards.menu_kb import (
     BTN_CLEAR_DB,
     BTN_HELP,
     BTN_MY_FILES,
+    BTN_RESET_SESSION,
     get_main_reply_kb,
     get_start_inline_kb,
 )
@@ -24,51 +25,31 @@ from bot.keyboards.user_kb import (
     get_user_docs_list_kb,
 )
 from bot.services.db_service import DatabaseService
-from bot.services.ingest import DocumentIngestionService
 from bot.services.queue_manager import QueueManager
-from bot.services.vector_db import VectorDBService
+from bot.services.rag_client import RAGApiClient
 from bot.utils.formatter import split_message_text, strip_html_tags
 
 router = Router(name="user_router")
-
-SUPPORTED_USER_EXTENSIONS = {
-    # PDF & Plain Text
-    ".pdf", ".txt", ".md",
-    # Microsoft Word & OpenDocument Text
-    ".docx", ".doc", ".docm", ".dotx", ".dotm", ".rtf", ".odt", ".ott",
-    # Microsoft Excel & OpenDocument Spreadsheet
-    ".xlsx", ".xls", ".xlsm", ".xltx", ".xltm", ".csv", ".ods", ".ots",
-    # Microsoft PowerPoint & OpenDocument Presentation
-    ".pptx", ".ppt", ".pptm", ".ppsx", ".pps", ".potx", ".potm", ".odp", ".otp",
-}
 
 
 @router.message(CommandStart())
 async def cmd_start(
     message: Message,
-    settings: Settings,
-    vector_db: VectorDBService
+    settings: Settings
 ) -> None:
     """Приветственное сообщение, установка нижнего меню и быстрые кнопки."""
     user_id = message.from_user.id if message.from_user else 0
     is_admin = user_id in settings.ADMIN_IDS
-    my_chunks = await vector_db.count(user_id)
 
     welcome_text = (
-        "👋 <b>Добро пожаловать в персональную RAG-систему SchoolX!</b>\n\n"
-        "🔒 <b>Полная изоляция данных:</b>\n"
-        "К вашему Telegram ID привязана <b>отдельная персональная база знаний</b>. "
-        "Файлы других пользователей изолированы и вам недоступны.\n\n"
-        f"📊 Сейчас в вашей базе: <b>{my_chunks}</b> фрагментов (чанков).\n\n"
-        "💡 <b>Возможности:</b>\n"
-        "• <b>Загрузка файлов:</b> Отправьте файл ("
-        "<b>Документы:</b> <code>.docx</code>, <code>.odt</code>, <code>.doc</code>, <code>.rtf</code>; "
-        "<b>Таблицы:</b> <code>.xlsx</code>, <code>.xls</code>, <code>.ods</code>, <code>.csv</code>; "
-        "<b>Презентации:</b> <code>.pptx</code>, <code>.ppt</code>, <code>.odp</code>; "
-        "<b>PDF/Текст:</b> <code>.pdf</code>, <code>.txt</code>, <code>.md</code>) в этот чат, и он сразу добавится в вашу личную базу и векторизуется.\n"
-        "• <b>Вопросы к базе:</b> Напишите любой вопрос обычным текстом, и бот ответит строго по вашим документам.\n"
-        "• <b>Управление:</b> Используйте удобные кнопки внизу экрана — вводить команды вручную больше не требуется!\n\n"
-        "<i>На GPU действует очередь: строго 1 запрос единовременно для стабильности.</i>"
+        "👋 <b>Добро пожаловать в интеллектуальную систему SchoolX!</b>\n\n"
+        "Я — ваш персональный ИИ-консультант по нормативным документам, регламентам и внутренним актам.\n\n"
+        "💡 <b>Как пользоваться:</b>\n"
+        "• <b>Задавайте вопросы:</b> Напишите любой интересующий вас вопрос обычным текстом. "
+        "Ответ будет сформирован строго на основе проверенных документов с указанием источников и страниц.\n"
+        "• <b>Новая тема диалога:</b> Используйте кнопку «🔄 Новая тема» или команду /reset, чтобы сбросить контекст беседы.\n"
+        "• <b>Справка:</b> Нажмите «📖 Справка» или введите /help для получения дополнительной информации.\n\n"
+        "<i>Задайте ваш первый вопрос прямо в этот чат!</i>"
     )
     # Отправляем постоянное нижнее меню (Reply Keyboard)
     await message.answer(
@@ -82,39 +63,64 @@ async def cmd_start(
     )
 
 
+@router.message(or_f(Command("reset"), Command("new_topic"), F.text.in_([BTN_RESET_SESSION, "🔄 Новая тема", "Сбросить контекст"])))
+async def cmd_reset_topic(
+    message: Message,
+    rag_client: RAGApiClient
+) -> None:
+    """Сброс контекста беседы на стороне RAG-приложения."""
+    chat_id = message.chat.id
+    try:
+        ok = await rag_client.reset_session(chat_id)
+        if ok:
+            await message.answer(
+                "🔄 <b>Контекст беседы сброшен.</b>\n\n"
+                "История предыдущих сообщений очищена на сервере базы знаний. "
+                "Задайте новый вопрос, и мы начнем новую тему диалога!"
+            )
+        else:
+            await message.answer(
+                "⚠️ Не удалось сбросить контекст беседы на сервере. Пожалуйста, повторите попытку."
+            )
+    except Exception as e:
+        logger.error(f"Error resetting session for chat {chat_id}: {e}")
+        await message.answer(
+            "❌ <b>Сервис базы знаний временно недоступен.</b>\n"
+            "Пожалуйста, повторите попытку сброса позже."
+        )
+
+
 @router.message(or_f(Command("help"), F.text.in_([BTN_HELP, "Справка", "Помощь"])))
 async def cmd_help(message: Message) -> None:
     """Справочная информация."""
     help_text = (
-        "📖 <b>Справка по персональной базе знаний:</b>\n\n"
-        "1. <b>Как наполнить базу:</b>\n"
-        "Отправьте боту документ (Word/ODT: .docx/.odt/.doc/.rtf, Excel: .xlsx/.xls/.ods/.csv, PowerPoint: .pptx/.ppt/.odp, PDF, TXT, MD). "
-        "Бот автоматически извлечет текст и таблицы, разобьет их на фрагменты (чанки) и векторизует в вашей персональной базе.\n\n"
-        "2. <b>Как задать вопрос:</b>\n"
-        "Отправьте вопрос текстом. Бот найдет нужные места именно в ваших документах и сформирует точный ответ со ссылкой на источник и страницу.\n\n"
-        "3. <b>Управление файлами:</b>\n"
-        "• Кнопка «📁 Мои документы» — посмотреть загруженные документы и удалить ненужные;\n"
-        "• Кнопка «🗑 Очистить базу» — полностью очистить вашу персональную базу.\n\n"
-        "4. <b>Подписка и тарифы:</b>\n"
-        "• Кнопка «💎 Тарифы и подписка» — витрина тарифов и скидок (Early-Bird -40%);\n"
-        "• Кнопка «📋 Моя подписка» — срок действия текущей подписки.\n\n"
-        "5. <b>Очередь:</b>\n"
-        "Для защиты VRAM инференс выполняется последовательно. При высокой нагрузке бот сообщит вашу позицию в очереди."
+        "📖 <b>Справка по работе с базой знаний:</b>\n\n"
+        "1. <b>Как задать вопрос:</b>\n"
+        "Отправьте вопрос текстом в чат. Система автоматически найдет релевантные разделы в нормативных документах, "
+        "сформирует точный структурированный ответ и приведет ссылки на первоисточники (документ и страницу).\n\n"
+        "2. <b>Управление контекстом и сессиями:</b>\n"
+        "Бот помнит контекст предыдущих реплик. Если вы хотите переключиться на совершенно другую тему, "
+        "нажмите кнопку «🔄 Новая тема» или отправьте команду /reset (/new_topic).\n\n"
+        "3. <b>Подписка и тарифы:</b>\n"
+        "• Кнопка «💎 Тарифы и подписка» — витрина тарифов;\n"
+        "• Кнопка «📋 Моя подписка» — статус вашей текущей подписки.\n\n"
+        "4. <b>Очередь и генерация:</b>\n"
+        "Для стабильности работы инференс выполняется последовательно. При высокой нагрузке бот сообщит вашу позицию в очереди."
     )
     await message.answer(help_text)
 
 
 @router.message(or_f(Command("my_files"), F.text.in_([BTN_MY_FILES, "Мои файлы", "Мои документы"])))
-async def cmd_my_files(message: Message, vector_db: VectorDBService) -> None:
+async def cmd_my_files(message: Message, db_service: DatabaseService) -> None:
     """Просмотр и управление личными документами пользователя."""
     user_id = message.from_user.id if message.from_user else 0
-    docs = await vector_db.get_sources_stats(user_id)
-    total_chunks = sum(d["chunk_count"] for d in docs)
+    user_docs = await db_service.get_user_documents(user_id)
+    docs = [{"source": d["filename"], "chunk_count": d.get("chunks_count", 0)} for d in user_docs]
+    total_docs = len(docs)
 
     text = (
-        "📂 <b>Ваша персональная база знаний</b>\n\n"
-        f"• Загружено документов: <b>{len(docs)}</b>\n"
-        f"• Всего векторизованных чанков: <b>{total_chunks}</b>\n\n"
+        "📂 <b>Ваши сохраненные документы</b>\n\n"
+        f"• Загружено документов: <b>{total_docs}</b>\n\n"
         "<i>Вы можете удалить любой документ кнопкой ниже:</i>"
     )
     await message.answer(text, reply_markup=get_user_docs_list_kb(docs))
@@ -124,8 +130,8 @@ async def cmd_my_files(message: Message, vector_db: VectorDBService) -> None:
 async def cmd_clear_my_db(message: Message) -> None:
     """Запрос на полную очистку персональной базы."""
     text = (
-        "⚠️ <b>Очистка персональной базы знаний</b>\n\n"
-        "Вы уверены, что хотите удалить ВСЕ свои проиндексированные документы? "
+        "⚠️ <b>Очистка сохраненных документов</b>\n\n"
+        "Вы уверены, что хотите удалить ВСЕ свои сохраненные документы? "
         "Это действие необратимо."
     )
     await message.answer(text, reply_markup=get_user_clear_confirm_kb())
@@ -135,16 +141,26 @@ async def cmd_clear_my_db(message: Message) -> None:
 # Загрузка личных документов пользователя
 # ==============================================================================
 
+SUPPORTED_USER_EXTENSIONS = {
+    # PDF & Plain Text
+    ".pdf", ".txt", ".md",
+    # Microsoft Word & OpenDocument Text
+    ".docx", ".doc", ".docm", ".dotx", ".dotm", ".rtf", ".odt", ".ott",
+    # Microsoft Excel & OpenDocument Spreadsheet
+    ".xlsx", ".xls", ".xlsm", ".xltx", ".xltm", ".csv", ".ods", ".ots",
+    # Microsoft PowerPoint & OpenDocument Presentation
+    ".pptx", ".ppt", ".pptm", ".ppsx", ".pps", ".potx", ".potm", ".odp", ".otp",
+}
+
+
 @router.message(F.document)
 async def handle_user_document_upload(
     message: Message,
     bot: Bot,
     settings: Settings,
-    vector_db: VectorDBService,
-    db_service: DatabaseService,
-    ingest_service: DocumentIngestionService
+    db_service: DatabaseService
 ) -> None:
-    """Прием и индексация документов в персональную базу пользователя."""
+    """Прием документов в хранилище без локального инференса."""
     user_id = message.from_user.id if message.from_user else 0
     doc = message.document
     if not doc or not doc.file_name:
@@ -165,8 +181,7 @@ async def handle_user_document_upload(
         return
 
     status_msg = await message.answer(
-        f"⏳ <b>Документ «{filename}» получен.</b>\n"
-        f"Выполняется извлечение текста, таблиц и векторизация на CPU..."
+        f"⏳ <b>Документ «{filename}» получен.</b> Сохраняю в хранилище..."
     )
 
     # Изолированная директория для пользователя
@@ -176,45 +191,26 @@ async def handle_user_document_upload(
 
     try:
         await bot.download(doc, destination=local_path)
-        logger.info(f"User {user_id}: Downloaded document '{filename}' to '{local_path}'.")
-
-        # Индексация в персональную коллекцию с учетом настроек пользователя
-        user_rag_cfg = settings.get_user_rag_config(user_id)
-        chunks_added = await ingest_service.ingest_file(
+        file_size = local_path.stat().st_size
+        await db_service.record_document(
             user_id=user_id,
-            file_path=local_path,
-            original_filename=filename,
-            vector_db=vector_db,
-            chunk_size=user_rag_cfg.chunk_size,
-            chunk_overlap=user_rag_cfg.chunk_overlap,
-            db_service=db_service,
+            filename=filename,
+            file_type=file_ext,
+            file_size=file_size,
+            chunks_count=0
         )
-
-        total_chunks = await vector_db.count(user_id)
         await status_msg.edit_text(
-            f"✅ <b>Документ «{filename}» успешно добавлен и векторизован в базе знаний!</b>\n\n"
-            f"• Добавлено новых фрагментов (чанков): <b>{chunks_added}</b>\n"
-            f"• Всего фрагментов в вашей базе: <b>{total_chunks}</b>\n"
-            f"• Запись о файле сохранена в БД.\n\n"
-            f"Теперь вы можете задавать любые вопросы по содержанию этого документа."
+            f"✅ <b>Документ «{filename}» успешно сохранен в хранилище!</b>\n\n"
+            f"• Размер: <b>{file_size / 1024:.1f} КБ</b>\n"
+            f"• Файл добавлен в очередь индексации базы знаний.\n\n"
+            "Вы можете задавать вопросы по базе знаний в любое время!"
         )
-        logger.info(f"User {user_id}: Ingestion success for '{filename}'.")
+        logger.info(f"User {user_id}: Downloaded and recorded '{filename}'.")
 
     except Exception as e:
-        logger.exception(f"Error during user ingestion for '{filename}': {e}")
-        err_msg = str(e)
-        if "Bad offset for central directory" in err_msg or "BadZipFile" in err_msg:
-            user_facing_err = (
-                "Файл поврежден или имеет неверный формат архива (BadZipFile). "
-                "Пожалуйста, проверьте целостность файла, сохраните его заново и повторите отправку."
-            )
-        elif "TimeoutError" in type(e).__name__ or "ClientConnectionError" in err_msg:
-            user_facing_err = "Таймаут скачивания файла из Telegram. Пожалуйста, попробуйте отправить файл еще раз."
-        else:
-            user_facing_err = err_msg
-
+        logger.exception(f"Error during user document upload for '{filename}': {e}")
         await status_msg.edit_text(
-            f"❌ <b>Ошибка при обработке документа «{filename}»:</b>\n<code>{user_facing_err}</code>"
+            f"❌ <b>Ошибка при сохранении документа:</b>\n<code>{e}</code>"
         )
 
 
@@ -237,39 +233,33 @@ async def handle_user_query(
     chat_id = message.chat.id
 
     try:
-        answer, log_id, queue_msg_id = await queue_manager.submit_query(
+        answer, log_id, status_flag = await queue_manager.submit_query(
             user_id=user_id,
             chat_id=chat_id,
             query=query,
             bot=bot
         )
 
-        if queue_msg_id:
-            try:
-                await bot.delete_message(chat_id=chat_id, message_id=queue_msg_id)
-            except Exception:
-                pass
-
-        # Отправка ответа: разбиение на части при превышении лимита Telegram и fallback при ошибках HTML
-        chunks = split_message_text(answer, max_length=4000)
-        for i, chunk in enumerate(chunks):
-            is_last = (i == len(chunks) - 1)
-            kb = get_feedback_keyboard(log_id) if is_last else None
-            try:
-                await message.answer(text=chunk, reply_markup=kb)
-            except TelegramBadRequest as tb_err:
-                logger.warning(
-                    f"Telegram HTML parsing error for user {user_id}: {tb_err}. "
-                    "Falling back to stripped plain text."
-                )
-                await message.answer(text=strip_html_tags(chunk), reply_markup=kb)
+        # Если ответ не был отправлен напрямую через стриминг
+        if status_flag == "NEEDS_SEND":
+            chunks = split_message_text(answer, max_length=4000)
+            for i, chunk in enumerate(chunks):
+                is_last = (i == len(chunks) - 1)
+                kb = get_feedback_keyboard(log_id) if (is_last and log_id > 0) else None
+                try:
+                    await message.answer(text=chunk, reply_markup=kb)
+                except TelegramBadRequest as tb_err:
+                    logger.warning(
+                        f"Telegram HTML parsing error for user {user_id}: {tb_err}. "
+                        "Falling back to stripped plain text."
+                    )
+                    await message.answer(text=strip_html_tags(chunk), reply_markup=kb)
 
     except Exception as exc:
         logger.error(f"Error handling query from user {user_id}: {exc}")
         await message.answer(
             "❌ <b>Произошла ошибка при обработке запроса.</b>\n"
-            "Возможно, локальный сервер LM Studio временно недоступен. "
-            "Пожалуйста, попробуйте снова через минуту или обратитесь к администратору."
+            "Пожалуйста, попробуйте снова через пару минут или обратитесь к администратору."
         )
 
 
@@ -278,15 +268,14 @@ async def handle_user_query(
 # ==============================================================================
 
 @router.callback_query(F.data == "user:docs:list")
-async def cb_user_docs_list(callback: CallbackQuery, vector_db: VectorDBService) -> None:
+async def cb_user_docs_list(callback: CallbackQuery, db_service: DatabaseService) -> None:
     user_id = callback.from_user.id if callback.from_user else 0
-    docs = await vector_db.get_sources_stats(user_id)
-    total_chunks = sum(d["chunk_count"] for d in docs)
+    user_docs = await db_service.get_user_documents(user_id)
+    docs = [{"source": d["filename"], "chunk_count": d.get("chunks_count", 0)} for d in user_docs]
 
     text = (
-        "📂 <b>Ваша персональная база знаний</b>\n\n"
-        f"• Загружено документов: <b>{len(docs)}</b>\n"
-        f"• Всего векторизованных чанков: <b>{total_chunks}</b>\n\n"
+        "📂 <b>Ваши сохраненные документы</b>\n\n"
+        f"• Загружено документов: <b>{len(docs)}</b>\n\n"
         "<i>Вы можете удалить любой документ кнопкой ниже:</i>"
     )
     if callback.message and isinstance(callback.message, Message):
@@ -295,7 +284,7 @@ async def cb_user_docs_list(callback: CallbackQuery, vector_db: VectorDBService)
 
 
 @router.callback_query(F.data.startswith("user:doc_del:"))
-async def cb_user_doc_del(callback: CallbackQuery, vector_db: VectorDBService) -> None:
+async def cb_user_doc_del(callback: CallbackQuery, db_service: DatabaseService) -> None:
     user_id = callback.from_user.id if callback.from_user else 0
     idx_str = callback.data.split(":")[2]
     if not idx_str.isdigit():
@@ -303,17 +292,14 @@ async def cb_user_doc_del(callback: CallbackQuery, vector_db: VectorDBService) -
         return
 
     idx = int(idx_str)
-    docs = await vector_db.get_sources_stats(user_id)
+    user_docs = await db_service.get_user_documents(user_id)
+    docs = [{"source": d["filename"], "chunk_count": d.get("chunks_count", 0)} for d in user_docs]
     if idx >= len(docs):
         await callback.answer("Файл уже удален.", show_alert=True)
         return
 
     filename = docs[idx]["source"]
-    chunks = docs[idx]["chunk_count"]
-    text = (
-        f"⚠️ <b>Удалить документ «{filename}»?</b>\n\n"
-        f"Будет удалено чанков из вашей базы: <b>{chunks}</b>."
-    )
+    text = f"⚠️ <b>Удалить документ «{filename}»?</b>"
     if callback.message and isinstance(callback.message, Message):
         await callback.message.edit_text(text, reply_markup=get_user_doc_confirm_delete_kb(idx))
     await callback.answer()
@@ -323,7 +309,6 @@ async def cb_user_doc_del(callback: CallbackQuery, vector_db: VectorDBService) -
 async def cb_user_doc_do_del(
     callback: CallbackQuery,
     settings: Settings,
-    vector_db: VectorDBService,
     db_service: DatabaseService,
 ) -> None:
     user_id = callback.from_user.id if callback.from_user else 0
@@ -333,13 +318,13 @@ async def cb_user_doc_do_del(
         return
 
     idx = int(idx_str)
-    docs = await vector_db.get_sources_stats(user_id)
+    user_docs = await db_service.get_user_documents(user_id)
+    docs = [{"source": d["filename"], "chunk_count": d.get("chunks_count", 0)} for d in user_docs]
     if idx >= len(docs):
         await callback.answer("Файл уже удален.", show_alert=True)
         return
 
     filename = docs[idx]["source"]
-    deleted = await vector_db.delete_source(user_id, filename)
     await db_service.delete_document(user_id, filename)
 
     local_file = settings.DOCS_STORAGE_DIR / str(user_id) / filename
@@ -349,14 +334,13 @@ async def cb_user_doc_do_del(
         except Exception:
             pass
 
-    await callback.answer(f"Документ «{filename}» удален ({deleted} чанков).", show_alert=True)
+    await callback.answer(f"Документ «{filename}» удален.", show_alert=True)
 
-    updated_docs = await vector_db.get_sources_stats(user_id)
-    total_chunks = sum(d["chunk_count"] for d in updated_docs)
+    updated_user_docs = await db_service.get_user_documents(user_id)
+    updated_docs = [{"source": d["filename"], "chunk_count": d.get("chunks_count", 0)} for d in updated_user_docs]
     text = (
-        "📂 <b>Ваша персональная база знаний</b>\n\n"
-        f"• Загружено документов: <b>{len(updated_docs)}</b>\n"
-        f"• Всего векторизованных чанков: <b>{total_chunks}</b>\n\n"
+        "📂 <b>Ваши сохраненные документы</b>\n\n"
+        f"• Загружено документов: <b>{len(updated_docs)}</b>\n\n"
         "<i>Вы можете удалить любой документ кнопкой ниже:</i>"
     )
     if callback.message and isinstance(callback.message, Message):
@@ -366,8 +350,8 @@ async def cb_user_doc_do_del(
 @router.callback_query(F.data == "user:doc_clear_confirm")
 async def cb_user_doc_clear_confirm(callback: CallbackQuery) -> None:
     text = (
-        "💥 <b>Полная очистка вашей личной базы знаний</b>\n\n"
-        "Вы действительно хотите удалить ВСЕ ваши документы из базы?\n"
+        "💥 <b>Полная очистка ваших документов</b>\n\n"
+        "Вы действительно хотите удалить ВСЕ ваши документы?\n"
         "Это действие необратимо."
     )
     if callback.message and isinstance(callback.message, Message):
@@ -378,15 +362,13 @@ async def cb_user_doc_clear_confirm(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "user:doc_do_clear")
 async def cb_user_doc_do_clear(
     callback: CallbackQuery,
-    vector_db: VectorDBService,
     db_service: DatabaseService,
 ) -> None:
     user_id = callback.from_user.id if callback.from_user else 0
-    cleared = await vector_db.clear_all(user_id)
-    await db_service.clear_user_documents(user_id)
-    await callback.answer(f"Ваша база знаний полностью очищена ({cleared} чанков удалено).", show_alert=True)
+    cleared = await db_service.clear_user_documents(user_id)
+    await callback.answer(f"Ваши документы удалены ({cleared} файлов).", show_alert=True)
 
-    text = "📂 <b>Ваша персональная база знаний пуста.</b>\nОтправьте файлы в чат, чтобы наполнить ее."
+    text = "📂 <b>У вас нет сохраненных документов.</b>"
     if callback.message and isinstance(callback.message, Message):
         await callback.message.edit_text(text, reply_markup=get_user_docs_list_kb([]))
 

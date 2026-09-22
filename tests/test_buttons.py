@@ -103,10 +103,7 @@ class TestButtonsUI(unittest.IsolatedAsyncioTestCase):
         msg.from_user = User(id=999000, is_bot=False, first_name="AdminUser")
         msg.answer = AsyncMock()
 
-        vector_db_mock = AsyncMock()
-        vector_db_mock.count.return_value = 42
-
-        await cmd_start(msg, settings=self.settings, vector_db=vector_db_mock)
+        await cmd_start(msg, settings=self.settings)
         self.assertEqual(msg.answer.await_count, 2)
 
         # Первое сообщение должно содержать ReplyKeyboardMarkup

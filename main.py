@@ -48,9 +48,8 @@ from bot.loader import (
     create_bot_session,
     db_service,
     dp,
-    openai_client,
     queue_manager,
-    vector_db,
+    rag_client,
 )
 from bot.middlewares.subscription_check import SubscriptionMiddleware
 
@@ -120,10 +119,12 @@ async def register_bot_commands() -> None:
     """Регистрация нативных команд и кнопки меню Telegram с защитой от таймаута."""
     user_commands = [
         BotCommand(command="start", description="🚀 Главное меню"),
+        BotCommand(command="reset", description="🔄 Новая тема (сброс контекста)"),
+        BotCommand(command="new_topic", description="🔄 Начать новую тему"),
         BotCommand(command="subscribe", description="💎 Тарифы и скидки 40%"),
         BotCommand(command="my_sub", description="📋 Моя подписка"),
         BotCommand(command="my_files", description="📁 Мои документы"),
-        BotCommand(command="clear_my_db", description="🗑 Очистить мою базу"),
+        BotCommand(command="clear_my_db", description="🗑 Очистить мои документы"),
         BotCommand(command="help", description="📖 Справка и помощь"),
     ]
     try:
@@ -181,18 +182,14 @@ async def main() -> None:
         initial_allowed_ids=settings.ALLOWED_TELEGRAM_IDS
     )
 
-    # 3. Инициализация ChromaDB и CPU FastEmbed модели
-    logger.info("Initializing ChromaDB and loading FastEmbed model on CPU...")
-    await vector_db.initialize()
-
-    # 4. Подключение middlewares и роутеров
+    # 3. Подключение middlewares и роутеров
     setup_routers_and_middlewares()
 
-    # 5. Запуск фонового воркера очереди к LM Studio (concurrency=1)
+    # 4. Запуск фонового воркера очереди взаимодействия с RAG API
     queue_manager.start(bot)
     logger.info(
-        f"SchoolX Bot core services ready! Admins: {len(settings.ADMIN_IDS)}, "
-        f"LM Studio: {settings.LM_STUDIO_URL}, Model: {settings.LM_STUDIO_MODEL}"
+        f"SchoolX Bot thin client ready! Admins: {len(settings.ADMIN_IDS)}, "
+        f"RAG Base URL: {settings.RAG_API_BASE_URL}, Stream enabled: {settings.RAG_STREAM_ENABLED}"
     )
 
     # Типы событий для long polling
@@ -258,7 +255,7 @@ async def main() -> None:
     finally:
         logger.warning("Shutting down SchoolX RAG Telegram Bot...")
         await queue_manager.stop()
-        await openai_client.close()
+        await rag_client.close()
         if bot.session and not bot.session.closed:
             try:
                 await bot.session.close()

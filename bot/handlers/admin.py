@@ -19,9 +19,8 @@ from bot.keyboards.admin_kb import (
 )
 from bot.keyboards.menu_kb import BTN_ADMIN_CONSOLE, BTN_ADMIN_STATS
 from bot.services.db_service import DatabaseService
-from bot.services.ingest import DocumentIngestionService
 from bot.services.queue_manager import QueueManager
-from bot.services.vector_db import VectorDBService
+from bot.services.rag_client import RAGApiClient
 
 router = Router(name="admin_router")
 
@@ -41,34 +40,37 @@ class AdminUserStates(StatesGroup):
     waiting_for_user_id = State()
 
 
-
 def is_admin(user_id: int, settings: Settings) -> bool:
     return user_id in settings.ADMIN_IDS
 
 
 def format_admin_dashboard(
     db_stats: dict,
-    my_chunks: int,
     my_sources_count: int,
-    sys_overview: dict,
+    rag_health: dict,
     q_status: dict,
     settings: Settings
 ) -> str:
     """Форматирование главного экрана админ-панели."""
+    backend_status = "🟢 Онлайн" if rag_health.get("status") == "healthy" else "🔴 Недоступен"
+    rag_device = rag_health.get("device", "N/A")
+    rag_service = rag_health.get("service", "schoolX-rag-api")
     inf_status = "🔴 Занят" if q_status["is_busy"] else "🟢 Свободен"
+
     return (
         "🛠 <b>Консоль администратора SchoolX RAG</b>\n\n"
-        "🔒 <b>Архитектура:</b> Multi-Tenant (отдельная БД для каждого ID)\n\n"
-        "👤 <b>Ваша личная база знаний:</b>\n"
-        f"• Документов: <b>{my_sources_count}</b>\n"
-        f"• Векторизованных чанков: <b>{my_chunks}</b>\n\n"
+        "🔒 <b>Архитектура:</b> Клиент-серверная (Тонкий клиент Bot ⇄ RAG Core API)\n\n"
+        "👤 <b>Ваши документы:</b>\n"
+        f"• Загружено файлов: <b>{my_sources_count}</b>\n\n"
         "🌐 <b>Всего в системе:</b>\n"
-        f"• Пользовательских баз: <b>{sys_overview['total_collections']}</b>\n"
-        f"• Суммарно чанков: <b>{sys_overview['total_chunks']}</b>\n"
-        f"• Пользователей в белом списке: <b>{db_stats['total_allowed_users']}</b>\n\n"
-        "⚡ <b>Статус инференса (LM Studio):</b>\n"
-        f"• Состояние: <b>{inf_status}</b> (очередь: <b>{q_status['queue_length']}</b>)\n"
-        f"• Модель: <code>{settings.LM_STUDIO_MODEL}</code>\n\n"
+        f"• Пользователей в белом списке: <b>{db_stats['total_allowed_users']}</b>\n"
+        f"• Документов пользователей: <b>{db_stats.get('total_documents', 0)}</b>\n"
+        f"• Всего запросов обработано: <b>{db_stats['total_queries']}</b>\n\n"
+        "⚡ <b>RAG Core Backend:</b>\n"
+        f"• Сервер: <code>{settings.RAG_API_BASE_URL}</code>\n"
+        f"• Статус сервиса: <b>{backend_status}</b> ({rag_service})\n"
+        f"• Устройство бэкенда: <code>{rag_device}</code>\n"
+        f"• Локальная очередь запросов: <b>{q_status['queue_length']}</b> ({inf_status})\n\n"
         "Выберите раздел для управления:"
     )
 
@@ -82,7 +84,7 @@ async def cmd_admin_console(
     message: Message,
     settings: Settings,
     db_service: DatabaseService,
-    vector_db: VectorDBService,
+    rag_client: RAGApiClient,
     queue_manager: QueueManager
 ) -> None:
     """Открытие интерактивной консоли администратора: /admin."""
@@ -91,12 +93,11 @@ async def cmd_admin_console(
 
     admin_id = message.from_user.id
     db_stats = await db_service.get_stats()
-    my_chunks = await vector_db.count(admin_id)
-    my_sources = await vector_db.get_unique_sources(admin_id)
-    sys_overview = await vector_db.get_system_overview()
+    user_docs = await db_service.get_user_documents(admin_id)
+    rag_health = await rag_client.health_check()
     q_status = queue_manager.get_status()
 
-    text = format_admin_dashboard(db_stats, my_chunks, len(my_sources), sys_overview, q_status, settings)
+    text = format_admin_dashboard(db_stats, len(user_docs), rag_health, q_status, settings)
     await message.answer(text, reply_markup=get_admin_main_kb())
 
 
@@ -126,8 +127,7 @@ async def cmd_add_user(
     target_id = int(target_str)
     await db_service.add_user(target_id, added_by=message.from_user.id)
     await message.answer(
-        f"✅ Пользователь <code>{target_id}</code> успешно добавлен в белый список.\n"
-        f"Для него создана персональная изолированная база знаний."
+        f"✅ Пользователь <code>{target_id}</code> успешно добавлен в белый список."
     )
     logger.info(f"Admin {message.from_user.id} whitelisted user {target_id}.")
 
@@ -171,10 +171,9 @@ async def cmd_ban_user(
 async def cmd_del_file(
     message: Message,
     settings: Settings,
-    vector_db: VectorDBService,
     db_service: DatabaseService,
 ) -> None:
-    """Текстовая команда удаления файла из личной базы: /del_file <filename>."""
+    """Текстовая команда удаления файла из личного хранилища: /del_file <filename>."""
     if not message.from_user or not is_admin(message.from_user.id, settings):
         return
 
@@ -189,8 +188,7 @@ async def cmd_del_file(
         return
 
     target_file = args[1].strip()
-    deleted_chunks = await vector_db.delete_source(admin_id, target_file)
-    await db_service.delete_document(admin_id, target_file)
+    deleted = await db_service.delete_document(admin_id, target_file)
 
     local_file = settings.DOCS_STORAGE_DIR / str(admin_id) / target_file
     if local_file.exists():
@@ -199,13 +197,12 @@ async def cmd_del_file(
         except Exception as e:
             logger.warning(f"Could not delete physical file '{local_file}': {e}")
 
-    if deleted_chunks > 0:
+    if deleted:
         await message.answer(
-            f"✅ Документ <b>«{target_file}»</b> успешно удален из вашей базы знаний.\n"
-            f"Удалено чанков: <b>{deleted_chunks}</b>."
+            f"✅ Документ <b>«{target_file}»</b> успешно удален из вашего списка документов."
         )
     else:
-        await message.answer(f"⚠️ Документ <b>«{target_file}»</b> не найден в вашей базе знаний.")
+        await message.answer(f"⚠️ Документ <b>«{target_file}»</b> не найден.")
 
 
 @router.message(or_f(Command("stats"), F.text.in_([BTN_ADMIN_STATS, "Статистика", "Метрики"])))
@@ -213,7 +210,7 @@ async def cmd_stats(
     message: Message,
     settings: Settings,
     db_service: DatabaseService,
-    vector_db: VectorDBService,
+    rag_client: RAGApiClient,
     queue_manager: QueueManager
 ) -> None:
     """Вывод подробной статистики системы: /stats."""
@@ -222,30 +219,31 @@ async def cmd_stats(
 
     admin_id = message.from_user.id
     db_stats = await db_service.get_stats()
-    my_chunks = await vector_db.count(admin_id)
-    my_sources = await vector_db.get_unique_sources(admin_id)
-    sys_overview = await vector_db.get_system_overview()
+    user_docs = await db_service.get_user_documents(admin_id)
+    sources = [d["filename"] for d in user_docs]
+    rag_health = await rag_client.health_check()
     q_status = queue_manager.get_status()
 
-    sources_preview = ", ".join(my_sources[:5]) if my_sources else "нет документов"
-    if len(my_sources) > 5:
-        sources_preview += f" (+ еще {len(my_sources) - 5})"
+    sources_preview = ", ".join(sources[:5]) if sources else "нет документов"
+    if len(sources) > 5:
+        sources_preview += f" (+ еще {len(sources) - 5})"
 
-    inference_state = "🔴 Занят генерацией" if q_status["is_busy"] else "🟢 Свободен (ожидает)"
+    backend_status = "🟢 Онлайн" if rag_health.get("status") == "healthy" else "🔴 Офлайн"
+    rag_device = rag_health.get("device", "N/A")
 
     stats_text = (
         "📊 <b>Статистика системы SchoolX RAG:</b>\n\n"
         "👥 <b>Пользователи:</b>\n"
         f"• Авторизовано в БД: <b>{db_stats['total_allowed_users']}</b>\n"
         f"• Системных администраторов: <b>{len(settings.ADMIN_IDS)}</b>\n\n"
-        "📚 <b>Векторные хранилища (ChromaDB + FastEmbed):</b>\n"
-        f"• Всего изолированных баз (пользователей): <b>{sys_overview['total_collections']}</b>\n"
-        f"• Суммарно чанков по всем базам: <b>{sys_overview['total_chunks']}</b>\n"
-        f"• В вашей личной базе: <b>{my_chunks}</b> чанков (файлы: <i>{sources_preview}</i>)\n"
-        f"• Модель эмбеддингов: <code>{settings.EMBEDDING_MODEL_NAME}</code> (CPU)\n\n"
-        "⚡ <b>Очередь инференса (RTX 4070 12GB - 1 поток):</b>\n"
-        f"• Задач в очереди: <b>{q_status['queue_length']}</b>\n"
-        f"• Статус инференса: <b>{inference_state}</b>\n\n"
+        "📚 <b>Хранилище документов:</b>\n"
+        f"• Всего документов в системе: <b>{db_stats.get('total_documents', 0)}</b>\n"
+        f"• В вашем хранилище: <b>{len(sources)}</b> (файлы: <i>{sources_preview}</i>)\n\n"
+        "⚡ <b>RAG Core Backend:</b>\n"
+        f"• URL сервиса: <code>{settings.RAG_API_BASE_URL}</code>\n"
+        f"• Статус бэкенда: <b>{backend_status}</b>\n"
+        f"• Устройство инференса: <code>{rag_device}</code>\n"
+        f"• Локальная очередь запросов: <b>{q_status['queue_length']}</b>\n\n"
         "💬 <b>Активность и качество:</b>\n"
         f"• Всего обработано запросов: <b>{db_stats['total_queries']}</b>\n"
         f"• Положительных оценок (👍): <b>{db_stats['positive_feedback']}</b>\n"
@@ -263,7 +261,7 @@ async def cb_admin_menu(
     callback: CallbackQuery,
     settings: Settings,
     db_service: DatabaseService,
-    vector_db: VectorDBService,
+    rag_client: RAGApiClient,
     queue_manager: QueueManager
 ) -> None:
     """Возврат на главный экран админ-консоли."""
@@ -273,12 +271,11 @@ async def cb_admin_menu(
 
     admin_id = callback.from_user.id
     db_stats = await db_service.get_stats()
-    my_chunks = await vector_db.count(admin_id)
-    my_sources = await vector_db.get_unique_sources(admin_id)
-    sys_overview = await vector_db.get_system_overview()
+    user_docs = await db_service.get_user_documents(admin_id)
+    rag_health = await rag_client.health_check()
     q_status = queue_manager.get_status()
 
-    text = format_admin_dashboard(db_stats, my_chunks, len(my_sources), sys_overview, q_status, settings)
+    text = format_admin_dashboard(db_stats, len(user_docs), rag_health, q_status, settings)
     if callback.message and isinstance(callback.message, Message):
         await callback.message.edit_text(text, reply_markup=get_admin_main_kb())
     await callback.answer()
@@ -288,7 +285,7 @@ async def cb_admin_menu(
 async def cb_admin_docs_list(
     callback: CallbackQuery,
     settings: Settings,
-    vector_db: VectorDBService
+    db_service: DatabaseService
 ) -> None:
     """Отображение списка документов личной базы администратора с возможностью удаления."""
     if not callback.from_user or not is_admin(callback.from_user.id, settings):
@@ -296,14 +293,13 @@ async def cb_admin_docs_list(
         return
 
     admin_id = callback.from_user.id
-    docs_info = await vector_db.get_sources_stats(admin_id)
-    total_chunks = sum(d["chunk_count"] for d in docs_info)
+    raw_docs = await db_service.get_user_documents(admin_id)
+    docs_info = [{"source": d["filename"], "chunk_count": d.get("chunks_count", 0)} for d in raw_docs]
 
     text = (
-        "📁 <b>Ваша личная база знаний (Администратор)</b>\n\n"
-        f"Всего загружено документов: <b>{len(docs_info)}</b>\n"
-        f"Всего фрагментов (чанков): <b>{total_chunks}</b>\n\n"
-        "<i>Нажмите «🗑️ Удалить» рядом с файлом, чтобы извлечь его из вашей базы:</i>"
+        "📁 <b>Ваши документы (Администратор)</b>\n\n"
+        f"Всего загружено документов: <b>{len(docs_info)}</b>\n\n"
+        "<i>Нажмите «🗑️ Удалить» рядом с файлом, чтобы извлечь его из хранилища:</i>"
     )
 
     if callback.message and isinstance(callback.message, Message):
@@ -315,7 +311,7 @@ async def cb_admin_docs_list(
 async def cb_admin_doc_del_confirm(
     callback: CallbackQuery,
     settings: Settings,
-    vector_db: VectorDBService
+    db_service: DatabaseService
 ) -> None:
     """Запрос подтверждения удаления файла."""
     if not callback.from_user or not is_admin(callback.from_user.id, settings):
@@ -329,19 +325,18 @@ async def cb_admin_doc_del_confirm(
         return
 
     idx = int(idx_str)
-    docs_info = await vector_db.get_sources_stats(admin_id)
+    raw_docs = await db_service.get_user_documents(admin_id)
+    docs_info = [{"source": d["filename"], "chunk_count": d.get("chunks_count", 0)} for d in raw_docs]
     if idx >= len(docs_info):
         await callback.answer("Файл уже удален или не найден.", show_alert=True)
         return
 
     target_doc = docs_info[idx]
     filename = target_doc["source"]
-    chunks = target_doc["chunk_count"]
 
     text = (
         f"⚠️ <b>Подтверждение удаления документа</b>\n\n"
-        f"Файл: <b>«{filename}»</b>\n"
-        f"Количество чанков в вашей базе: <b>{chunks}</b>\n\n"
+        f"Файл: <b>«{filename}»</b>\n\n"
         "Вы действительно хотите удалить этот документ?"
     )
 
@@ -354,10 +349,9 @@ async def cb_admin_doc_del_confirm(
 async def cb_admin_doc_do_delete(
     callback: CallbackQuery,
     settings: Settings,
-    vector_db: VectorDBService,
     db_service: DatabaseService,
 ) -> None:
-    """Фактическое удаление документа из персональной базы админа."""
+    """Фактическое удаление документа из хранилища админа."""
     if not callback.from_user or not is_admin(callback.from_user.id, settings):
         await callback.answer("Доступ запрещен.", show_alert=True)
         return
@@ -369,13 +363,13 @@ async def cb_admin_doc_do_delete(
         return
 
     idx = int(idx_str)
-    docs_info = await vector_db.get_sources_stats(admin_id)
+    raw_docs = await db_service.get_user_documents(admin_id)
+    docs_info = [{"source": d["filename"], "chunk_count": d.get("chunks_count", 0)} for d in raw_docs]
     if idx >= len(docs_info):
         await callback.answer("Файл уже удален.", show_alert=True)
         return
 
     filename = docs_info[idx]["source"]
-    deleted_chunks = await vector_db.delete_source(admin_id, filename)
     await db_service.delete_document(admin_id, filename)
 
     local_file = settings.DOCS_STORAGE_DIR / str(admin_id) / filename
@@ -385,15 +379,14 @@ async def cb_admin_doc_do_delete(
         except Exception as e:
             logger.warning(f"Failed to delete disk file '{local_file}': {e}")
 
-    await callback.answer(f"Файл «{filename}» удален ({deleted_chunks} чанков)!", show_alert=True)
+    await callback.answer(f"Файл «{filename}» удален!", show_alert=True)
 
-    updated_docs = await vector_db.get_sources_stats(admin_id)
-    total_chunks = sum(d["chunk_count"] for d in updated_docs)
+    updated_raw = await db_service.get_user_documents(admin_id)
+    updated_docs = [{"source": d["filename"], "chunk_count": d.get("chunks_count", 0)} for d in updated_raw]
     text = (
-        "📁 <b>Ваша личная база знаний (Администратор)</b>\n\n"
-        f"Всего загружено документов: <b>{len(updated_docs)}</b>\n"
-        f"Всего фрагментов (чанков): <b>{total_chunks}</b>\n\n"
-        "<i>Нажмите «🗑️ Удалить» рядом с файлом, чтобы извлечь его из базы:</i>"
+        "📁 <b>Ваши документы (Администратор)</b>\n\n"
+        f"Всего загружено документов: <b>{len(updated_docs)}</b>\n\n"
+        "<i>Нажмите «🗑️ Удалить» рядом с файлом, чтобы извлечь его:</i>"
     )
     if callback.message and isinstance(callback.message, Message):
         await callback.message.edit_text(text, reply_markup=get_docs_list_kb(updated_docs))
@@ -401,14 +394,14 @@ async def cb_admin_doc_do_delete(
 
 @router.callback_query(F.data == "admin:doc_clear_confirm")
 async def cb_admin_doc_clear_confirm(callback: CallbackQuery, settings: Settings) -> None:
-    """Подтверждение полной очистки базы знаний."""
+    """Подтверждение полной очистки хранилища документов."""
     if not callback.from_user or not is_admin(callback.from_user.id, settings):
         await callback.answer("Доступ запрещен.", show_alert=True)
         return
 
     text = (
-        "💥 <b>Очистка вашей базы знаний</b>\n\n"
-        "Вы собираетесь удалить ВСЕ проиндексированные документы из вашей личной базы.\n"
+        "💥 <b>Очистка хранилища документов</b>\n\n"
+        "Вы собираетесь удалить ВСЕ сохраненные документы из вашего личного хранилища.\n"
         "Это действие необратимо!\n\n"
         "Вы уверены?"
     )
@@ -421,26 +414,23 @@ async def cb_admin_doc_clear_confirm(callback: CallbackQuery, settings: Settings
 async def cb_admin_doc_do_clear(
     callback: CallbackQuery,
     settings: Settings,
-    vector_db: VectorDBService,
     db_service: DatabaseService,
 ) -> None:
-    """Полная очистка личной коллекции админа."""
+    """Полная очистка документов админа."""
     if not callback.from_user or not is_admin(callback.from_user.id, settings):
         await callback.answer("Доступ запрещен.", show_alert=True)
         return
 
     admin_id = callback.from_user.id
-    cleared_count = await vector_db.clear_all(admin_id)
-    await db_service.clear_user_documents(admin_id)
-    await callback.answer(f"База очищена! Удалено {cleared_count} чанков.", show_alert=True)
+    cleared_count = await db_service.clear_user_documents(admin_id)
+    await callback.answer(f"Хранилище очищено! Удалено {cleared_count} записей.", show_alert=True)
 
-    updated_docs = await vector_db.get_sources_stats(admin_id)
     text = (
-        "📁 <b>Ваша личная база знаний</b>\n\n"
-        "База знаний пуста. Загрузите новые документы, отправив их файлом в чат."
+        "📁 <b>Ваше хранилище документов</b>\n\n"
+        "Хранилище пусто. Загрузите новые документы, отправив их файлом в чат."
     )
     if callback.message and isinstance(callback.message, Message):
-        await callback.message.edit_text(text, reply_markup=get_docs_list_kb(updated_docs))
+        await callback.message.edit_text(text, reply_markup=get_docs_list_kb([]))
 
 
 @router.callback_query(F.data == "admin:users:list")
@@ -458,7 +448,7 @@ async def cb_admin_users_list(
     text = (
         "👥 <b>Управление доступом пользователей</b>\n\n"
         f"Всего авторизовано: <b>{len(allowed_users)}</b>\n\n"
-        "<i>У каждого пользователя изолированная персональная база данных.</i>\n"
+        "<i>У каждого пользователя изолированная история и хранилище.</i>\n"
         "Нажмите «🚫 Забанить», чтобы закрыть доступ:"
     )
     if callback.message and isinstance(callback.message, Message):
@@ -577,7 +567,6 @@ async def handle_admin_user_id_input(
 
     await message.answer(
         f"✅ Пользователь <code>{target_id}</code> успешно добавлен в систему!\n"
-        "Для него создана персональная изолированная база знаний."
     )
     logger.info(f"Admin {message.from_user.id} added user {target_id} via button FSM.")
 
@@ -587,7 +576,7 @@ async def cb_admin_stats(
     callback: CallbackQuery,
     settings: Settings,
     db_service: DatabaseService,
-    vector_db: VectorDBService,
+    rag_client: RAGApiClient,
     queue_manager: QueueManager
 ) -> None:
     """Отображение подробной статистики с кнопкой Назад."""
@@ -597,30 +586,31 @@ async def cb_admin_stats(
 
     admin_id = callback.from_user.id
     db_stats = await db_service.get_stats()
-    my_chunks = await vector_db.count(admin_id)
-    my_sources = await vector_db.get_unique_sources(admin_id)
-    sys_overview = await vector_db.get_system_overview()
+    user_docs = await db_service.get_user_documents(admin_id)
+    sources = [d["filename"] for d in user_docs]
+    rag_health = await rag_client.health_check()
     q_status = queue_manager.get_status()
 
-    sources_preview = ", ".join(my_sources[:5]) if my_sources else "нет документов"
-    if len(my_sources) > 5:
-        sources_preview += f" (+ еще {len(my_sources) - 5})"
+    sources_preview = ", ".join(sources[:5]) if sources else "нет документов"
+    if len(sources) > 5:
+        sources_preview += f" (+ еще {len(sources) - 5})"
 
-    inference_state = "🔴 Занят генерацией" if q_status["is_busy"] else "🟢 Свободен (ожидает)"
+    backend_status = "🟢 Онлайн" if rag_health.get("status") == "healthy" else "🔴 Офлайн"
+    rag_device = rag_health.get("device", "N/A")
 
     stats_text = (
         "📊 <b>Детальная статистика SchoolX RAG:</b>\n\n"
         "👥 <b>Пользователи:</b>\n"
         f"• Авторизовано в БД: <b>{db_stats['total_allowed_users']}</b>\n"
         f"• Системных администраторов: <b>{len(settings.ADMIN_IDS)}</b>\n\n"
-        "📚 <b>Векторные хранилища (ChromaDB + FastEmbed):</b>\n"
-        f"• Всего изолированных баз (пользователей): <b>{sys_overview['total_collections']}</b>\n"
-        f"• Суммарно чанков по всем базам: <b>{sys_overview['total_chunks']}</b>\n"
-        f"• В вашей личной базе: <b>{my_chunks}</b> чанков (файлы: <i>{sources_preview}</i>)\n"
-        f"• Модель эмбеддингов: <code>{settings.EMBEDDING_MODEL_NAME}</code> (CPU)\n\n"
-        "⚡ <b>Очередь инференса (RTX 4070 12GB - 1 поток):</b>\n"
-        f"• Задач в очереди: <b>{q_status['queue_length']}</b>\n"
-        f"• Статус инференса: <b>{inference_state}</b>\n\n"
+        "📚 <b>Хранилище документов:</b>\n"
+        f"• Всего документов в системе: <b>{db_stats.get('total_documents', 0)}</b>\n"
+        f"• В вашем хранилище: <b>{len(sources)}</b> (файлы: <i>{sources_preview}</i>)\n\n"
+        "⚡ <b>RAG Core Backend:</b>\n"
+        f"• URL сервиса: <code>{settings.RAG_API_BASE_URL}</code>\n"
+        f"• Статус бэкенда: <b>{backend_status}</b>\n"
+        f"• Устройство инференса: <code>{rag_device}</code>\n"
+        f"• Локальная очередь запросов: <b>{q_status['queue_length']}</b>\n\n"
         "💬 <b>Активность и качество:</b>\n"
         f"• Всего обработано запросов: <b>{db_stats['total_queries']}</b>\n"
         f"• Положительных оценок (👍): <b>{db_stats['positive_feedback']}</b>\n"

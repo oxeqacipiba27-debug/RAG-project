@@ -11,6 +11,7 @@ BTN_MY_SUB = "📋 Моя подписка"
 BTN_MY_FILES = "📁 Мои документы"
 BTN_CLEAR_DB = "🗑 Очистить базу"
 BTN_HELP = "📖 Справка"
+BTN_RESET_SESSION = "🔄 Новая тема"
 
 # Кнопки для администраторов
 BTN_ADMIN_CONSOLE = "🛠 Админ-консоль"
@@ -27,6 +28,10 @@ ALL_MENU_BUTTONS = {
     BTN_MY_FILES,
     BTN_CLEAR_DB,
     BTN_HELP,
+    BTN_RESET_SESSION,
+    "🔄 Новая тема",
+    "Новая тема",
+    "Сбросить контекст",
     BTN_ADMIN_CONSOLE,
     BTN_ADMIN_BILLING,
     BTN_ADMIN_STATS,
@@ -57,16 +62,17 @@ def get_main_reply_kb(is_admin: bool = False) -> ReplyKeyboardMarkup:
     """Главная постоянная Reply-клавиатура внизу экрана."""
     if is_admin:
         keyboard = [
+            [KeyboardButton(text=BTN_RESET_SESSION), KeyboardButton(text=BTN_HELP)],
             [KeyboardButton(text=BTN_TARIFFS), KeyboardButton(text=BTN_MY_SUB)],
             [KeyboardButton(text=BTN_MY_FILES), KeyboardButton(text=BTN_CLEAR_DB)],
             [KeyboardButton(text=BTN_ADMIN_CONSOLE), KeyboardButton(text=BTN_ADMIN_BILLING)],
-            [KeyboardButton(text=BTN_ADMIN_STATS), KeyboardButton(text=BTN_HELP)],
+            [KeyboardButton(text=BTN_ADMIN_STATS)],
         ]
     else:
         keyboard = [
+            [KeyboardButton(text=BTN_RESET_SESSION), KeyboardButton(text=BTN_HELP)],
             [KeyboardButton(text=BTN_TARIFFS), KeyboardButton(text=BTN_MY_SUB)],
             [KeyboardButton(text=BTN_MY_FILES), KeyboardButton(text=BTN_CLEAR_DB)],
-            [KeyboardButton(text=BTN_HELP)],
         ]
 
     return ReplyKeyboardMarkup(
