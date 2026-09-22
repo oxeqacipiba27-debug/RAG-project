@@ -1,0 +1,30 @@
+# Telegram Bot Framework
+aiogram>=3.14.0
+aiohttp-socks>=0.10.0
+
+# LLM Inference (LM Studio OpenAI-compatible API)
+openai>=1.50.0
+
+# Vector Database & CPU Embeddings
+chromadb>=0.5.0
+fastembed>=0.4.0
+
+# Configuration & Settings
+pydantic>=2.8.0
+pydantic-settings>=2.4.0
+python-dotenv>=1.0.1
+
+# Logging
+loguru>=0.7.2
+
+# Persistence & Storage
+aiosqlite>=0.20.0
+
+# Document Ingestion & Parsing
+pypdf>=5.0.0
+python-docx>=1.1.2
+openpyxl>=3.1.5
+python-pptx>=1.0.2
+xlrd>=2.0.2
+striprtf>=0.0.33
+olefile>=0.47
